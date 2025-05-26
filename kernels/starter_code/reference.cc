@@ -18,8 +18,9 @@ void MatmulOperator::mat_mul_reference(struct matmul_params *params) {
 
     int m = C->row, n = C->column, k = A->column;
     // A: m x k; B: n x k; C: m x n
+     for (int col = 0; col < n; col++) {
     for (int row = 0; row < m; row++) {
-        for (int col = 0; col < n; col++) {
+       
             float acc = 0;
             // Compute each block
             for (int ch = 0; ch < k;) {
@@ -47,6 +48,8 @@ void MatmulOperator::mat_mul_reference(struct matmul_params *params) {
                 for (int qj = 0; qj < 16; qj++) {
                     // decode a packed byte into two int8 in the range of (-8, 7)
                     uint8_t packed_int4_0 = w_int4[qj];
+
+                    // Every packed byte of the form (w_{i+16}, w_i)
                     signed char w_de_0 = (packed_int4_0 & 0x0F) - 8.0;
                     signed char w_de_16 = (packed_int4_0 >> 4) - 8.0;
                     // int8 multiply and accumulate operation
