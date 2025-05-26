@@ -46,7 +46,9 @@ void MatmulOperator::mat_mul_simd_programming(struct matmul_params *params) {
             float *s_w = &params->scales[col * k / 32];
 
             const int num_block = k / block_size;
-            // Compute each block
+            const uint8x16_t mask_low4bit = vdupq_n_u8(0xf);
+            const int8x16_t offsets = vdupq_n_s8(8);
+            // Compute each block (each block is 32 elements)
             for (int q = 0; q < num_block; q++) {
                 // load 32x4bit (16 bytes) weight
                 const uint8x16_t w0 = vld1q_u8(w_start);
@@ -62,11 +64,18 @@ void MatmulOperator::mat_mul_simd_programming(struct matmul_params *params) {
                 // (2) use `vshrq_n_u8` to right shift 4 bits and get the upper half
                 // (3) use `vreinterpretq_s8_u8` to interpret the  vector as int8
                 // lowbit mask
-                const uint8x16_t mask_low4bit = vdupq_n_u8(0xf);
+                
+                const uint8x16_t w_de_0 = vandq_u8(mask_low4bit, w0); 
+                const uint8x16_t w_de_16 = vshrq_n_u8(w0, 4);
+                
 
                 // TODO: apply zero_point to weights and convert the range from (0, 15) to (-8, 7)
                 // Hint: using `vsubq_s8` to the lower-half and upper-half vectors of weights
-                const int8x16_t offsets = vdupq_n_s8(8);
+                
+
+                const int8x16_t signed_w0 = vsubq_s8(vreinterpretq_s8_u8(w_de_0), offsets); 
+                const int8x16_t signed_w16 = vsubq_s8(vreinterpretq_s8_u8(w_de_16), offsets); 
+
 
                 // load 32 8-bit activation
                 const int8x16_t a0 = vld1q_s8(a_start);
@@ -76,7 +85,11 @@ void MatmulOperator::mat_mul_simd_programming(struct matmul_params *params) {
                 // TODO: perform dot product and store the result into the intermediate sum, int_sum0
                 // Hint: use `vdotq_s32` to compute sumv0 = a0 * lower-half weights + a1 * upper-half weights
                 // int32x4 vector to store intermediate sum
-                int32x4_t int_sum0;
+                int32x4_t int_sum0 = vdupq_n_s32(0); 
+
+                int_sum0 = vdotq_s32(int_sum0, a0, signed_w0); 
+                int_sum0 = vdotq_s32(int_sum0, a1, signed_w16); 
+
 
                 float s_0 = *s_a++ * *s_w++;
                 sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(int_sum0), s_0);
