@@ -17,6 +17,7 @@
 .venv
 .vs/
 .vscode/
+transformer/chat*
 
 assets/
 *.bin
