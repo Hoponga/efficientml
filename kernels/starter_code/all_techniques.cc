@@ -28,6 +28,8 @@ static void *all_techniques_worker_func(void *args) {
     for (int row = 0; row < m; row++) {
         for (int col = mat_args->start_j; col < mat_args->end_j; col++) {
 #ifdef QM_ARM
+            const uint8x16_t mask_low4bit = vdupq_n_u8(0xf);
+            const int8x16_t offsets = vdupq_n_s8(8);
             // order of weights with QM_ARM:
             // origin order: (w0,w1), (w2,w3), (w4,w5), (w6,w7), (w8, w9), ... (w30,w31)
             // QM_ARM order: (w0,w16),(w1,w17),(w2,w18),(w3,w19),(w4, w20),... (w15,w31)
@@ -59,17 +61,31 @@ static void *all_techniques_worker_func(void *args) {
                 const uint8x16_t w3 = vld1q_u8(w_start + 48);  // 32 4bit weight
                 w_start += 64;
 
+                
+
+
                 // TODO: decode each uint8x16_t weight vector into the lower and upper half of the weights as int8x16_t
                 // Hint:
                 // (1) use `vandq_u8` with the mask_low4bit to get the lower half
                 // (2) use `vshrq_n_u8` to right shift 4 bits and get the upper half
                 // (3) use `vreinterpretq_s8_u8` to interpret the  vector as int8
                 // lowbit mask
-                const uint8x16_t mask_low4bit = vdupq_n_u8(0xf);
+                const int8x16_t signed_w0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(mask_low4bit, w0)), offsets); 
+                const int8x16_t signed_w0_16 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w0, 4)), offsets); 
+
+                const int8x16_t signed_w1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(mask_low4bit, w1)), offsets); 
+                const int8x16_t signed_w1_16 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w1, 4)), offsets); 
+
+                const int8x16_t signed_w2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(mask_low4bit, w2)), offsets); 
+                const int8x16_t signed_w2_16 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w2, 4)), offsets); 
+
+                const int8x16_t signed_w3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(mask_low4bit, w3)), offsets); 
+                const int8x16_t signed_w3_16 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w3, 4)), offsets); 
+                
 
                 // TODO: apply zero_point to weights and convert the range from (0, 15) to (-8, 7)
                 // Hint: using `vsubq_s8` to the lower-half and upper-half vectors of weights
-                const int8x16_t offsets = vdupq_n_s8(8);
+                
 
                 // load 128 8-bit activation
                 const int8x16_t a0 = vld1q_s8(a_start);
@@ -85,6 +101,23 @@ static void *all_techniques_worker_func(void *args) {
                 // TODO: perform dot product and store the result into the intermediate sum, int_sum0
                 // Hint: use `vdotq_s32` and store the sum for each block in int_sum{0-3}
                 int32x4_t int_sum0, int_sum1, int_sum2, int_sum3;
+                int_sum0 = vdupq_n_s32(0); 
+                int_sum1 = vdupq_n_s32(0); 
+                int_sum2 = vdupq_n_s32(0); 
+                int_sum3 = vdupq_n_s32(0); 
+
+                int_sum0 = vdotq_s32(int_sum0, a0, signed_w0); 
+                int_sum0 = vdotq_s32(int_sum0, a1, signed_w0_16); 
+
+                int_sum1 = vdotq_s32(int_sum1, a2, signed_w1); 
+                int_sum1 = vdotq_s32(int_sum1, a3, signed_w1_16); 
+
+                int_sum2 = vdotq_s32(int_sum2, a4, signed_w2); 
+                int_sum2 = vdotq_s32(int_sum2, a5, signed_w2_16); 
+
+                int_sum3 = vdotq_s32(int_sum3, a6, signed_w3); 
+                int_sum3 = vdotq_s32(int_sum3, a7, signed_w3_16); 
+
 
                 float s_0 = *s_a++ * *s_w++;
                 float s_1 = *s_a++ * *s_w++;
@@ -221,7 +254,23 @@ void MatmulOperator::mat_mul_all_techniques(struct matmul_params *params) {
     struct w4a8_thread_args threads_args[num_thread];
     assert(params->block_size == 32);  // support block size 32 for now
 
+     int thread_block_size = C->column / num_thread; 
+
     // TODO: Thread creation
+    for (int i = 0; i < num_thread; ++i) {
+        threads_args[i].start_j = i*thread_block_size; 
+        threads_args[i].end_j = (i+1)*thread_block_size; 
+        threads_args[i].params = params; 
+        pthread_create(&thread_pool[i], nullptr, all_techniques_worker_func, &threads_args[i]); 
+
+    }
+
+    // TODO: Join threads
+
+    for (int i = 0; i < num_thread; ++i) {
+        pthread_join(thread_pool[i], nullptr); 
+
+    }
 
     // TODO: Join threads
 };

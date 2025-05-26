@@ -179,5 +179,6 @@ void MatmulOperator::mat_mul_multithreading_loop_unrolling(struct matmul_params 
     }
 
     // TODO: Join threads
+    //test 
 };
 }  // namespace matmul
