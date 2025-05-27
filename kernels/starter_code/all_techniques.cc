@@ -71,10 +71,12 @@ static inline void kernel_8x4(float *Cptr, int ldc, const int8_t *Aptr, int lda,
     for (int i = 0; i < MC; i++) acc[i] = vdupq_n_f32(0.f); 
 
     // k loop -- k multiple of 32, treat two 16-byte dot products as 32 multiplies per iteration 
-    for (int k = 0; k < k_left; k+= 32) {
+    for (int k = 0, blk = 0; k < k_left; k+= 32, ++blk) {
         const int8_t *B0 = Bptr + k*4; // 4 columns contiguous, already packed 
         int8x16_t b0 = vld1q_s8(B0); 
         int8x16_t b1 = vld1q_s8(B0 + 16); 
+        const float scl = Sa[blk]*Sw[blk]; 
+
         for (int i = 0; i < MC; i++) {
             const int8_t *Arow = Aptr + (size_t)i*lda + k; 
             int8x16_t a0 = vld1q_s8(Arow); 
@@ -83,15 +85,14 @@ static inline void kernel_8x4(float *Cptr, int ldc, const int8_t *Aptr, int lda,
             int32x4_t dot = vdotq_s32(vdupq_n_s32(0), a0, b0); 
             dot = vdotq_s32(dot, a1, b1); 
 
-            acc[i] = vaddq_f32(acc[i], vcvtq_f32_s32(dot)); 
+            acc[i] = vfmaq_n_f32(acc[i], vcvtq_f32_s32(dot), scl); 
+            
 
         }
     }
-    const float scl = (*Sa)* (*Sw); 
     for (int i = 0; i < MC; i++) {
-        float32x4_t c_old = vld1q_f32(Cptr + (size_t)i * ldc); 
-        c_old = vfmaq_n_f32(c_old, acc[i], scl); 
-        vst1q_f32(Cptr + (size_t)i*ldc, c_old); 
+        vst1q_f32(Cptr + (size_t)i*ldc, vaddq_f32(vld1q_f32(Cptr + (size_t)i*ldc), acc[i])); 
+
 
     }
 }
@@ -114,19 +115,18 @@ static void *worker(void *arg_) {
         // inner dimension of matmul 
         for (int pc = 0; pc < k; pc += KC) {
             const int klim = std::min(KC, k - pc); 
-            pack_B_panel(packedB, &B->int4_data_ptr[(size_t)jc * k / 2 + pc / 2], k, jlim); 
-            for (int ic = 0; ic < m; jc += MC) {
+            pack_B_panel(packedB, &B->int4_data_ptr[(size_t)jc * k / 2 + pc / 2], klim, jlim); 
+            for (int ic = 0; ic < m; ic += MC) {
                 const int ilim = std::min(MC, m - ic); 
 
                 // potential TODO: memset the C-tile to zero? 
-
                 const int8_t *Aptr = &A->int8_data_ptr[(size_t)ic * k + pc]; 
                 const float *Sa = &params->A_scales[(size_t)ic * k / 32 + pc / 32]; 
-                const float *Sw = &params->scales[(size_t) jc * k/32 + pc / 32]; 
+                const float *Sw = &params->scales[(size_t) (jc) * k/32 + pc / 32]; 
 
                 // micro tiles: 4 columns each  (over the N dimension of the output matrix)
                 for (int j = 0; j < jlim; j += 4) {
-                    kernel_8x4(&C->data_ptr[(size_t)ic * n + jc + j], n, Aptr, k, packedB + (size_t)j *KC*2, jlim*KC*2, Sa, Sw + (size_t)j*KC/32, klim); 
+                    kernel_8x4(&C->data_ptr[(size_t)ic * n + jc + j], n, Aptr, k, packedB + (size_t)j *KC*2, jlim*KC*2, Sa, Sw + j*k/32, klim); 
 
                 }
             }
