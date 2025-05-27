@@ -16,8 +16,8 @@
 #include <immintrin.h>
 #endif
 // Cache blocking values 
-static constexpr int KC = 128; 
-static constexpr int NC = 1; 
+static constexpr int KC = 512; 
+static constexpr int NC = 2; 
 static constexpr int MC = 1; 
 
 struct thread_arg {
@@ -35,6 +35,7 @@ static void* matmul_int8_int4_no_offset_optimized(void* arg_) {
     const int num_block = k / block_size;
     const uint8x16_t mask_low4bit = vdupq_n_u8(0xf);
     const int8x16_t offsets = vdupq_n_s8(8);
+    alignas(64) int8_t w_scratch[KC * 4]; 
     
     
     
@@ -43,16 +44,34 @@ static void* matmul_int8_int4_no_offset_optimized(void* arg_) {
             
                 const int blk_lim = KC / params->block_size; 
                 for (int ic = 0; ic < m; ic += MC) {
+                    const int ilim = std::min(MC, m - ic); 
+
                     if (pc == 0) {
-                        for (int ii = 0; ii < MC; ii++) {
+                        for (int ii = 0; ii < ilim; ii++) {
                             memset(&params->C.data_ptr[(ic + ii)*n + jc], 0, NC * sizeof(float)); 
 
                         }
 
                     }
+                    const int jlim = std::min(NC, args->end_j - jc); 
 
-                    for (int j = 0; j < NC; j++) {
-                        const uint8_t* w_col = &params->B.int4_data_ptr[(jc + j)*k / 2 + pc / 2]; 
+
+                    for (int j = 0; j < jlim; j++) {
+                        const uint8_t* w_src = &params->B.int4_data_ptr[((jc + j)*k/2) + pc/2]; 
+                        int8_t* w_dec = w_scratch; 
+
+                        for (int blk = 0; blk < blk_lim; ++blk) {
+                            uint8x16_t w0 = vld1q_u8(w_src); 
+                            uint8x16_t w1 = vld1q_u8(w_src + 16); 
+                            w_src += 32; 
+                            int8x16_t lo = vreinterpretq_s8_u8(vandq_u8(w0, mask_low4bit)); 
+                            int8x16_t hi = vreinterpretq_s8_u8(vshrq_n_u8(w0, 4)); 
+                            vst1q_s8(w_dec, vsubq_s8(lo, offsets)); 
+                            vst1q_s8(w_dec + 16, vsubq_s8(hi, offsets)); 
+
+                            w_dec += 32; 
+
+                        }
                         const float* sw = &params->scales[(jc + j)*k / 32 + pc / 32]; 
                         for (int ii = 0; ii < MC; ++ii) {
                             const int8_t* a_row = &params->A.int8_data_ptr[(ic + ii)*k + pc]; 
@@ -61,10 +80,9 @@ static void* matmul_int8_int4_no_offset_optimized(void* arg_) {
                             float32x4_t sumv1 = vdupq_n_f32(0.0f);
                             float32x4_t sumv2 = vdupq_n_f32(0.0f);
                             float32x4_t sumv3 = vdupq_n_f32(0.0f);
-
-                            const uint8_t* w_ptr = w_col; 
                             const int8_t* a_ptr = a_row; 
                             for (int blk = 0; blk < blk_lim; blk += 4) {
+                                const int8_t* w_blk = w_scratch + blk * 32; 
                                 int32x4_t int_sum0 = vdupq_n_s32(0);
                                 int32x4_t int_sum1 = vdupq_n_s32(0);
                                 int32x4_t int_sum2 = vdupq_n_s32(0);
@@ -74,35 +92,15 @@ static void* matmul_int8_int4_no_offset_optimized(void* arg_) {
                                 float s_2 = *sa++ * *sw++;
                                 float s_3 = *sa++ * *sw++;
 
-                                const uint8x16_t w0 = vld1q_u8(w_ptr);       // 32 4bit weight
-                                const uint8x16_t w1 = vld1q_u8(w_ptr + 16);  // 32 4bit weight
-                                const uint8x16_t w2 = vld1q_u8(w_ptr + 32);  // 32 4bit weight
-                                const uint8x16_t w3 = vld1q_u8(w_ptr + 48);  // 32 4bit weight
-                                w_ptr += 64;
-
-                                // Quantization Method QM_ARM, convert 64 4-bit to 64 8-bit
-                                // sequential: (0, 1), (2, 3), (4, 5), (6, 7)... : 128 bit
-                                // expected layout of inB: (0, 16), (1, 17), (2, 18), (3, 19)...
-                                // low; (0, 0), (1, 0), (2, 0), (3, 0) ...
-                                // high: (16, 0), (17, 0), (18, 0), (19, 0) ...
-                                int8x16_t w0_low = vreinterpretq_s8_u8(vandq_u8(w0, mask_low4bit));
-                                int8x16_t w0_high = vreinterpretq_s8_u8(vshrq_n_u8(w0, 4));
-                                int8x16_t w1_low = vreinterpretq_s8_u8(vandq_u8(w1, mask_low4bit));
-                                int8x16_t w1_high = vreinterpretq_s8_u8(vshrq_n_u8(w1, 4));
-                                int8x16_t w2_low = vreinterpretq_s8_u8(vandq_u8(w2, mask_low4bit));
-                                int8x16_t w2_high = vreinterpretq_s8_u8(vshrq_n_u8(w2, 4));
-                                int8x16_t w3_low = vreinterpretq_s8_u8(vandq_u8(w3, mask_low4bit));
-                                int8x16_t w3_high = vreinterpretq_s8_u8(vshrq_n_u8(w3, 4));
-
-                                // apply offset
-                                w0_low = vsubq_s8(w0_low, offsets);
-                                w0_high = vsubq_s8(w0_high, offsets);
-                                w1_low = vsubq_s8(w1_low, offsets);
-                                w1_high = vsubq_s8(w1_high, offsets);
-                                w2_low = vsubq_s8(w2_low, offsets);
-                                w2_high = vsubq_s8(w2_high, offsets);
-                                w3_low = vsubq_s8(w3_low, offsets);
-                                w3_high = vsubq_s8(w3_high, offsets);
+                                const int8x16_t w0_low = vld1q_s8(w_blk);       // 32 4bit weight
+                                const int8x16_t w0_high = vld1q_s8(w_blk + 16); 
+                                const int8x16_t w1_low = vld1q_s8(w_blk + 32);       // 32 4bit weight
+                                const int8x16_t w1_high = vld1q_s8(w_blk + 48); 
+                                const int8x16_t w2_low = vld1q_s8(w_blk + 64);       // 32 4bit weight
+                                const int8x16_t w2_high = vld1q_s8(w_blk + 80); 
+                                const int8x16_t w3_low = vld1q_s8(w_blk + 96);       // 32 4bit weight
+                                const int8x16_t w3_high = vld1q_s8(w_blk + 112); 
+                                
 
                                 // load 64 8-bit activation
                                 const int8x16_t a0 = vld1q_s8(a_ptr);
