@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 #include "../matmul.h"
 #include "common.h"
@@ -16,127 +17,228 @@
 #endif
 // Cache blocking values 
 static constexpr int KC = 128; 
-static constexpr int NC = 32; 
-static constexpr int MC = 8; 
+static constexpr int NC = 1; 
+static constexpr int MC = 1; 
 
 struct thread_arg {
     int start_j, end_j;
     const struct matmul_params *params;
-    int8_t *scratch; // Scratch space for this thread, lives in L1? 
 };
 
-struct w4a8_thread_args {
-    int start_j, end_j;
-    const struct matmul_params *params;
-};
+static void* matmul_int8_int4_no_offset_optimized(void* arg_) {
+    const struct thread_arg* args = (struct thread_arg*) arg_; 
 
+    const struct matmul_params *params = args->params;
+    int n = params->C.column, m = params->C.row, k = params->A.column, block_size = params->block_size;
+    assert(params->block_size == 32);
 
-
-// pack B matrix into the scratch for this thread 
-static inline void pack_B_panel(int8_t *dst, const uint8_t *src, int k, int n_cols) {
-    const uint8x16_t mask_low4 = vdupq_n_u8(0x0f); 
-    const int8x16_t offs = vdupq_n_s8(8); 
-
-    for (int j = 0; j < n_cols; j++) {
-        const uint8_t *col = src + (size_t) j * k/2; 
-        int8_t* out = dst + (size_t)j * KC * 2; 
-        for (int b = 0; b < KC; b += 32) {
-            uint8x16_t v0 = vld1q_u8(col + b); 
-            uint8x16_t v1 = vld1q_u8(col + b + 16); // unroll by 2 
-
-            int8x16_t lo0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0, mask_low4)), offs); 
-            int8x16_t lo1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v1, mask_low4)), offs); 
-
-            vst1q_s8(out, lo0); 
-            vst1q_s8(out + 16, lo1); 
-
-            v0 = vshrq_n_u8(v0, 4); 
-            v1 = vshrq_n_u8(v1, 4); 
-            int8x16_t hi0 = vsubq_s8(vreinterpretq_s8_u8(v0), offs); 
-            int8x16_t hi1 = vsubq_s8(vreinterpretq_s8_u8(v1), offs); 
-            vst1q_s8(out + 32, hi0); 
-            vst1q_s8(out + 48, hi1); 
-            out += 64; 
-
-
-
-        }
-
-    }
-
-}
-
-static inline void kernel_8x4(float *Cptr, int ldc, const int8_t *Aptr, int lda, const int8_t *Bptr, int ldb, const float *Sa, const float *Sw, int k_left) {
-    float32x4_t acc[MC]; 
-    for (int i = 0; i < MC; i++) acc[i] = vdupq_n_f32(0.f); 
-
-    // k loop -- k multiple of 32, treat two 16-byte dot products as 32 multiplies per iteration 
-    for (int k = 0, blk = 0; k < k_left; k+= 32, ++blk) {
-        const int8_t *B0 = Bptr + k*4; // 4 columns contiguous, already packed 
-        int8x16_t b0 = vld1q_s8(B0); 
-        int8x16_t b1 = vld1q_s8(B0 + 16); 
-        const float scl = Sa[blk]*Sw[blk]; 
-
-        for (int i = 0; i < MC; i++) {
-            const int8_t *Arow = Aptr + (size_t)i*lda + k; 
-            int8x16_t a0 = vld1q_s8(Arow); 
-            int8x16_t a1 = vld1q_s8(Arow + 16); 
-
-            int32x4_t dot = vdotq_s32(vdupq_n_s32(0), a0, b0); 
-            dot = vdotq_s32(dot, a1, b1); 
-
-            acc[i] = vfmaq_n_f32(acc[i], vcvtq_f32_s32(dot), scl); 
-            
-
-        }
-    }
-    for (int i = 0; i < MC; i++) {
-        vst1q_f32(Cptr + (size_t)i*ldc, vaddq_f32(vld1q_f32(Cptr + (size_t)i*ldc), acc[i])); 
-
-
-    }
-}
-
-
-// worker function 
-
-static void *worker(void *arg_) {
-    thread_arg *arg = static_cast<thread_arg*>(arg_); 
-
-    const struct matmul_params *params = arg->params;
-    const struct matrix *A = &params->A, *B = &params->B, *C = &params->C;
-    const int block_size = params->block_size;
-
-    const int m = C->row, n = C->column, k = A->column;
-
-    int8_t *packedB = arg->scratch; 
-    for (int jc = arg->start_j; jc < arg->end_j; jc += NC) {
-        const int jlim = std::min(NC, arg->end_j - jc); 
-        // inner dimension of matmul 
+    const int num_block = k / block_size;
+    const uint8x16_t mask_low4bit = vdupq_n_u8(0xf);
+    const int8x16_t offsets = vdupq_n_s8(8);
+    
+    
+    
+    for (int jc = args->start_j; jc < args->end_j; jc += NC) {
         for (int pc = 0; pc < k; pc += KC) {
-            const int klim = std::min(KC, k - pc); 
-            pack_B_panel(packedB, &B->int4_data_ptr[(size_t)jc * k / 2 + pc / 2], klim, jlim); 
-            for (int ic = 0; ic < m; ic += MC) {
-                const int ilim = std::min(MC, m - ic); 
+            
+                const int blk_lim = KC / params->block_size; 
+                for (int ic = 0; ic < m; ic += MC) {
+                    if (pc == 0) {
+                        for (int ii = 0; ii < MC; ii++) {
+                            memset(&params->C.data_ptr[(ic + ii)*n + jc], 0, NC * sizeof(float)); 
 
-                // potential TODO: memset the C-tile to zero? 
-                const int8_t *Aptr = &A->int8_data_ptr[(size_t)ic * k + pc]; 
-                const float *Sa = &params->A_scales[(size_t)ic * k / 32 + pc / 32]; 
-                const float *Sw = &params->scales[(size_t) (jc) * k/32 + pc / 32]; 
+                        }
 
-                // micro tiles: 4 columns each  (over the N dimension of the output matrix)
-                for (int j = 0; j < jlim; j += 4) {
-                    kernel_8x4(&C->data_ptr[(size_t)ic * n + jc + j], n, Aptr, k, packedB + (size_t)j *KC*2, jlim*KC*2, Sa, Sw + j*k/32, klim); 
+                    }
 
+                    for (int j = 0; j < NC; j++) {
+                        const uint8_t* w_col = &params->B.int4_data_ptr[(jc + j)*k / 2 + pc / 2]; 
+                        const float* sw = &params->scales[(jc + j)*k / 32 + pc / 32]; 
+                        for (int ii = 0; ii < MC; ++ii) {
+                            const int8_t* a_row = &params->A.int8_data_ptr[(ic + ii)*k + pc]; 
+                            const float* sa = &params->A_scales[(ic + ii)*k/32 + pc / 32]; 
+                            float32x4_t sumv0 = vdupq_n_f32(0.0f);
+                            float32x4_t sumv1 = vdupq_n_f32(0.0f);
+                            float32x4_t sumv2 = vdupq_n_f32(0.0f);
+                            float32x4_t sumv3 = vdupq_n_f32(0.0f);
+
+                            const uint8_t* w_ptr = w_col; 
+                            const int8_t* a_ptr = a_row; 
+                            for (int blk = 0; blk < blk_lim; blk += 4) {
+                                int32x4_t int_sum0 = vdupq_n_s32(0);
+                                int32x4_t int_sum1 = vdupq_n_s32(0);
+                                int32x4_t int_sum2 = vdupq_n_s32(0);
+                                int32x4_t int_sum3 = vdupq_n_s32(0);
+                                float s_0 = *sa++ * *sw++;
+                                float s_1 = *sa++ * *sw++;
+                                float s_2 = *sa++ * *sw++;
+                                float s_3 = *sa++ * *sw++;
+
+                                const uint8x16_t w0 = vld1q_u8(w_ptr);       // 32 4bit weight
+                                const uint8x16_t w1 = vld1q_u8(w_ptr + 16);  // 32 4bit weight
+                                const uint8x16_t w2 = vld1q_u8(w_ptr + 32);  // 32 4bit weight
+                                const uint8x16_t w3 = vld1q_u8(w_ptr + 48);  // 32 4bit weight
+                                w_ptr += 64;
+
+                                // Quantization Method QM_ARM, convert 64 4-bit to 64 8-bit
+                                // sequential: (0, 1), (2, 3), (4, 5), (6, 7)... : 128 bit
+                                // expected layout of inB: (0, 16), (1, 17), (2, 18), (3, 19)...
+                                // low; (0, 0), (1, 0), (2, 0), (3, 0) ...
+                                // high: (16, 0), (17, 0), (18, 0), (19, 0) ...
+                                int8x16_t w0_low = vreinterpretq_s8_u8(vandq_u8(w0, mask_low4bit));
+                                int8x16_t w0_high = vreinterpretq_s8_u8(vshrq_n_u8(w0, 4));
+                                int8x16_t w1_low = vreinterpretq_s8_u8(vandq_u8(w1, mask_low4bit));
+                                int8x16_t w1_high = vreinterpretq_s8_u8(vshrq_n_u8(w1, 4));
+                                int8x16_t w2_low = vreinterpretq_s8_u8(vandq_u8(w2, mask_low4bit));
+                                int8x16_t w2_high = vreinterpretq_s8_u8(vshrq_n_u8(w2, 4));
+                                int8x16_t w3_low = vreinterpretq_s8_u8(vandq_u8(w3, mask_low4bit));
+                                int8x16_t w3_high = vreinterpretq_s8_u8(vshrq_n_u8(w3, 4));
+
+                                // apply offset
+                                w0_low = vsubq_s8(w0_low, offsets);
+                                w0_high = vsubq_s8(w0_high, offsets);
+                                w1_low = vsubq_s8(w1_low, offsets);
+                                w1_high = vsubq_s8(w1_high, offsets);
+                                w2_low = vsubq_s8(w2_low, offsets);
+                                w2_high = vsubq_s8(w2_high, offsets);
+                                w3_low = vsubq_s8(w3_low, offsets);
+                                w3_high = vsubq_s8(w3_high, offsets);
+
+                                // load 64 8-bit activation
+                                const int8x16_t a0 = vld1q_s8(a_ptr);
+                                const int8x16_t a1 = vld1q_s8(a_ptr + 16);
+                                const int8x16_t a2 = vld1q_s8(a_ptr + 32);
+                                const int8x16_t a3 = vld1q_s8(a_ptr + 48);
+                                const int8x16_t a4 = vld1q_s8(a_ptr + 64);
+                                const int8x16_t a5 = vld1q_s8(a_ptr + 80);
+                                const int8x16_t a6 = vld1q_s8(a_ptr + 96);
+                                const int8x16_t a7 = vld1q_s8(a_ptr + 112);
+                                a_ptr += 128;
+
+                                // dot product into int32x4_t
+                                int_sum0 = vdotq_s32(int_sum0, w0_low, a0);
+                                int_sum0 = vdotq_s32(int_sum0, w0_high, a1);
+                                int_sum1 = vdotq_s32(int_sum1, w1_low, a2);
+                                int_sum1 = vdotq_s32(int_sum1, w1_high, a3);
+                                int_sum2 = vdotq_s32(int_sum2, w2_low, a4);
+                                int_sum2 = vdotq_s32(int_sum2, w2_high, a5);
+                                int_sum3 = vdotq_s32(int_sum3, w3_low, a6);
+                                int_sum3 = vdotq_s32(int_sum3, w3_high, a7);
+
+                                sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(int_sum0), s_0);
+                                sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(int_sum1), s_1);
+                                sumv2 = vmlaq_n_f32(sumv2, vcvtq_f32_s32(int_sum2), s_2);
+                                sumv3 = vmlaq_n_f32(sumv3, vcvtq_f32_s32(int_sum3), s_3);
+
+                            }
+                            params->C.data_ptr[(ic + ii)* n + (jc + j)] +=
+                                vaddvq_f32(sumv0) + vaddvq_f32(sumv1) + vaddvq_f32(sumv2) + vaddvq_f32(sumv3);
+
+
+                        }
+                    }
                 }
+
             }
-        }
+        
     }
-
-
     return nullptr; 
-
 }
+
+
+// static void* matmul_int8_int4_no_offset(void* arg_) {
+//     const struct thread_arg* args = (struct thread_arg*) arg_; 
+
+//     const struct matmul_params *params = args->params;
+//     int n = params->C.column, m = params->C.row, k = params->A.column, block_size = params->block_size;
+//     assert(params->block_size == 32);
+
+//     const int num_block = k / block_size;
+//     for (int i = 0; i < m; i++) {
+//         for (int j = args->start_j; j < args->end_j; j++) {
+//             float32x4_t sumv0 = vdupq_n_f32(0.0f);
+//             float32x4_t sumv1 = vdupq_n_f32(0.0f);
+//             float32x4_t sumv2 = vdupq_n_f32(0.0f);
+//             float32x4_t sumv3 = vdupq_n_f32(0.0f);
+//             const unsigned char* w_start = &params->B.int4_data_ptr[j * k / 2];
+//             const signed char* a_start = &params->A.int8_data_ptr[i * k];
+//             float* s_a = &params->A_scales[i * k / 32];
+//             float* s_w = &params->scales[j * k / 32];
+
+//             const uint8x16_t mask_low4bit = vdupq_n_u8(0xf);
+//             const int8x16_t offsets = vdupq_n_s8(8);
+//             for (int q = 0; q < num_block; q += 4) {
+//                 int32x4_t int_sum0 = vdupq_n_s32(0);
+//                 int32x4_t int_sum1 = vdupq_n_s32(0);
+//                 int32x4_t int_sum2 = vdupq_n_s32(0);
+//                 int32x4_t int_sum3 = vdupq_n_s32(0);
+//                 float s_0 = *s_a++ * *s_w++;
+//                 float s_1 = *s_a++ * *s_w++;
+//                 float s_2 = *s_a++ * *s_w++;
+//                 float s_3 = *s_a++ * *s_w++;
+
+//                 const uint8x16_t w0 = vld1q_u8(w_start);       // 32 4bit weight
+//                 const uint8x16_t w1 = vld1q_u8(w_start + 16);  // 32 4bit weight
+//                 const uint8x16_t w2 = vld1q_u8(w_start + 32);  // 32 4bit weight
+//                 const uint8x16_t w3 = vld1q_u8(w_start + 48);  // 32 4bit weight
+//                 w_start += 64;
+
+//                 // Quantization Method QM_ARM, convert 64 4-bit to 64 8-bit
+//                 // sequential: (0, 1), (2, 3), (4, 5), (6, 7)... : 128 bit
+//                 // expected layout of inB: (0, 16), (1, 17), (2, 18), (3, 19)...
+//                 // low; (0, 0), (1, 0), (2, 0), (3, 0) ...
+//                 // high: (16, 0), (17, 0), (18, 0), (19, 0) ...
+//                 int8x16_t w0_low = vreinterpretq_s8_u8(vandq_u8(w0, mask_low4bit));
+//                 int8x16_t w0_high = vreinterpretq_s8_u8(vshrq_n_u8(w0, 4));
+//                 int8x16_t w1_low = vreinterpretq_s8_u8(vandq_u8(w1, mask_low4bit));
+//                 int8x16_t w1_high = vreinterpretq_s8_u8(vshrq_n_u8(w1, 4));
+//                 int8x16_t w2_low = vreinterpretq_s8_u8(vandq_u8(w2, mask_low4bit));
+//                 int8x16_t w2_high = vreinterpretq_s8_u8(vshrq_n_u8(w2, 4));
+//                 int8x16_t w3_low = vreinterpretq_s8_u8(vandq_u8(w3, mask_low4bit));
+//                 int8x16_t w3_high = vreinterpretq_s8_u8(vshrq_n_u8(w3, 4));
+
+//                 // apply offset
+//                 w0_low = vsubq_s8(w0_low, offsets);
+//                 w0_high = vsubq_s8(w0_high, offsets);
+//                 w1_low = vsubq_s8(w1_low, offsets);
+//                 w1_high = vsubq_s8(w1_high, offsets);
+//                 w2_low = vsubq_s8(w2_low, offsets);
+//                 w2_high = vsubq_s8(w2_high, offsets);
+//                 w3_low = vsubq_s8(w3_low, offsets);
+//                 w3_high = vsubq_s8(w3_high, offsets);
+
+//                 // load 64 8-bit activation
+//                 const int8x16_t a0 = vld1q_s8(a_start);
+//                 const int8x16_t a1 = vld1q_s8(a_start + 16);
+//                 const int8x16_t a2 = vld1q_s8(a_start + 32);
+//                 const int8x16_t a3 = vld1q_s8(a_start + 48);
+//                 const int8x16_t a4 = vld1q_s8(a_start + 64);
+//                 const int8x16_t a5 = vld1q_s8(a_start + 80);
+//                 const int8x16_t a6 = vld1q_s8(a_start + 96);
+//                 const int8x16_t a7 = vld1q_s8(a_start + 112);
+//                 a_start += 128;
+
+//                 // dot product into int32x4_t
+//                 int_sum0 = vdotq_s32(int_sum0, w0_low, a0);
+//                 int_sum0 = vdotq_s32(int_sum0, w0_high, a1);
+//                 int_sum1 = vdotq_s32(int_sum1, w1_low, a2);
+//                 int_sum1 = vdotq_s32(int_sum1, w1_high, a3);
+//                 int_sum2 = vdotq_s32(int_sum2, w2_low, a4);
+//                 int_sum2 = vdotq_s32(int_sum2, w2_high, a5);
+//                 int_sum3 = vdotq_s32(int_sum3, w3_low, a6);
+//                 int_sum3 = vdotq_s32(int_sum3, w3_high, a7);
+
+//                 sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(int_sum0), s_0);
+//                 sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(int_sum1), s_1);
+//                 sumv2 = vmlaq_n_f32(sumv2, vcvtq_f32_s32(int_sum2), s_2);
+//                 sumv3 = vmlaq_n_f32(sumv3, vcvtq_f32_s32(int_sum3), s_3);
+//             }
+//             params->C.data_ptr[i * n + j] =
+//                 vaddvq_f32(sumv0) + vaddvq_f32(sumv1) + vaddvq_f32(sumv2) + vaddvq_f32(sumv3);
+//         }
+//     }
+//     return nullptr; 
+// }
 
 namespace matmul {
 
@@ -152,22 +254,18 @@ void MatmulOperator::mat_mul_all_techniques(struct matmul_params *params) {
 
     quantize_fp32_to_int8(A->data_ptr, A->int8_data_ptr, params->A_scales, A->row * A->column, block_size);
 
-    const int num_thread = 8;
+    const int num_thread = 32;
     pthread_t thread_pool[num_thread];
     struct thread_arg targs[num_thread];
 
-    int8_t *scratch[num_thread]; 
-    for (int t = 0; t < num_thread; ++t) {
-        posix_memalign(reinterpret_cast<void**>(&scratch[t]), 64, NC * KC * 2); 
-    }
     assert(params->block_size == 32);  // support block size 32 for now
 
      int thread_block_size = C->column / num_thread; 
 
     // TODO: Thread creation
     for (int i = 0; i < num_thread; ++i) {
-        targs[i] = {i*thread_block_size, std::min(C->column, (i+1)*thread_block_size), params, scratch[i]}; 
-        pthread_create(&thread_pool[i], nullptr, worker, &targs[i]); 
+        targs[i] = {i*thread_block_size, std::min(C->column, (i+1)*thread_block_size), params}; 
+        pthread_create(&thread_pool[i], nullptr, matmul_int8_int4_no_offset_optimized, &targs[i]); 
 
     }
 
@@ -175,8 +273,6 @@ void MatmulOperator::mat_mul_all_techniques(struct matmul_params *params) {
 
     for (int i = 0; i < num_thread; ++i) {
         pthread_join(thread_pool[i], nullptr); 
-        free(scratch[i]); 
-
 
     }
 };
