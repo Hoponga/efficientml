@@ -14,230 +14,133 @@
 #ifdef QM_x86
 #include <immintrin.h>
 #endif
+// Cache blocking values 
+static constexpr int KC = 128; 
+static constexpr int NC = 32; 
+static constexpr int MC = 8; 
+
+struct thread_arg {
+    int start_j, end_j;
+    const struct matmul_params *params;
+    int8_t *scratch; // Scratch space for this thread, lives in L1? 
+};
+
 struct w4a8_thread_args {
     int start_j, end_j;
     const struct matmul_params *params;
 };
-static void *all_techniques_worker_func(void *args) {
-    struct w4a8_thread_args *mat_args = (struct w4a8_thread_args *)args;
-    const struct matmul_params *params = mat_args->params;
+
+
+
+// pack B matrix into the scratch for this thread 
+static inline void pack_B_panel(int8_t *dst, const uint8_t *src, int k, int n_cols) {
+    const uint8x16_t mask_low4 = vdupq_n_u8(0x0f); 
+    const int8x16_t offs = vdupq_n_s8(8); 
+
+    for (int j = 0; j < n_cols; j++) {
+        const uint8_t *col = src + (size_t) j * k/2; 
+        int8_t* out = dst + (size_t)j * KC * 2; 
+        for (int b = 0; b < KC; b += 32) {
+            uint8x16_t v0 = vld1q_u8(col + b); 
+            uint8x16_t v1 = vld1q_u8(col + b + 16); // unroll by 2 
+
+            int8x16_t lo0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0, mask_low4)), offs); 
+            int8x16_t lo1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v1, mask_low4)), offs); 
+
+            vst1q_s8(out, lo0); 
+            vst1q_s8(out + 16, lo1); 
+
+            v0 = vshrq_n_u8(v0, 4); 
+            v1 = vshrq_n_u8(v1, 4); 
+            int8x16_t hi0 = vsubq_s8(vreinterpretq_s8_u8(v0), offs); 
+            int8x16_t hi1 = vsubq_s8(vreinterpretq_s8_u8(v1), offs); 
+            vst1q_s8(out + 32, hi0); 
+            vst1q_s8(out + 48, hi1); 
+            out += 64; 
+
+
+
+        }
+
+    }
+
+}
+
+static inline void kernel_8x4(float *Cptr, int ldc, const int8_t *Aptr, int lda, const int8_t *Bptr, int ldb, const float *Sa, const float *Sw, int k_left) {
+    float32x4_t acc[MC]; 
+    for (int i = 0; i < MC; i++) acc[i] = vdupq_n_f32(0.f); 
+
+    // k loop -- k multiple of 32, treat two 16-byte dot products as 32 multiplies per iteration 
+    for (int k = 0; k < k_left; k+= 32) {
+        const int8_t *B0 = Bptr + k*4; // 4 columns contiguous, already packed 
+        int8x16_t b0 = vld1q_s8(B0); 
+        int8x16_t b1 = vld1q_s8(B0 + 16); 
+        for (int i = 0; i < MC; i++) {
+            const int8_t *Arow = Aptr + (size_t)i*lda + k; 
+            int8x16_t a0 = vld1q_s8(Arow); 
+            int8x16_t a1 = vld1q_s8(Arow + 16); 
+
+            int32x4_t dot = vdotq_s32(vdupq_n_s32(0), a0, b0); 
+            dot = vdotq_s32(dot, a1, b1); 
+
+            acc[i] = vaddq_f32(acc[i], vcvtq_f32_s32(dot)); 
+
+        }
+    }
+    const float scl = (*Sa)* (*Sw); 
+    for (int i = 0; i < MC; i++) {
+        float32x4_t c_old = vld1q_f32(Cptr + (size_t)i * ldc); 
+        c_old = vfmaq_n_f32(c_old, acc[i], scl); 
+        vst1q_f32(Cptr + (size_t)i*ldc, c_old); 
+
+    }
+}
+
+
+// worker function 
+
+static void *worker(void *arg_) {
+    thread_arg *arg = static_cast<thread_arg*>(arg_); 
+
+    const struct matmul_params *params = arg->params;
     const struct matrix *A = &params->A, *B = &params->B, *C = &params->C;
-    int n = params->C.column, m = params->C.row, k = params->A.column, block_size = params->block_size;
-    const int num_block = k / block_size;  // block_size = 32
+    const int block_size = params->block_size;
 
-    for (int row = 0; row < m; row++) {
-        for (int col = mat_args->start_j; col < mat_args->end_j; col++) {
-#ifdef QM_ARM
-            const uint8x16_t mask_low4bit = vdupq_n_u8(0xf);
-            const int8x16_t offsets = vdupq_n_s8(8);
-            // order of weights with QM_ARM:
-            // origin order: (w0,w1), (w2,w3), (w4,w5), (w6,w7), (w8, w9), ... (w30,w31)
-            // QM_ARM order: (w0,w16),(w1,w17),(w2,w18),(w3,w19),(w4, w20),... (w15,w31)
-            //               |--|
-            //               4 bits
-            //               |------|
-            //               8 bits (byte)
-            //            low|----------------------------------------------------------|high
-            //               0                         128 bit                         127
-            float32x4_t sumv0 = vdupq_n_f32(0.0f);
-            float32x4_t sumv1 = vdupq_n_f32(0.0f);
-            float32x4_t sumv2 = vdupq_n_f32(0.0f);
-            float32x4_t sumv3 = vdupq_n_f32(0.0f);
-            // pointer of the int4 weights
-            const unsigned char *w_start = &params->B.int4_data_ptr[col * k / 2];
-            // pointer of the int8 activation
-            const signed char *a_start = &params->A.int8_data_ptr[row * k];
-            // scale of activation
-            float *s_a = &params->A_scales[row * k / 32];
-            // scale of weight
-            float *s_w = &params->scales[col * k / 32];
+    const int m = C->row, n = C->column, k = A->column;
 
-            // process four blocks each iteration
-            for (int q = 0; q < num_block; q += 4) {
-                // load 32x4bit (16 bytes) weight
-                const uint8x16_t w0 = vld1q_u8(w_start);       // 32 4bit weight
-                const uint8x16_t w1 = vld1q_u8(w_start + 16);  // 32 4bit weight
-                const uint8x16_t w2 = vld1q_u8(w_start + 32);  // 32 4bit weight
-                const uint8x16_t w3 = vld1q_u8(w_start + 48);  // 32 4bit weight
-                w_start += 64;
+    int8_t *packedB = arg->scratch; 
+    for (int jc = arg->start_j; jc < arg->end_j; jc += NC) {
+        const int jlim = std::min(NC, arg->end_j - jc); 
+        // inner dimension of matmul 
+        for (int pc = 0; pc < k; pc += KC) {
+            const int klim = std::min(KC, k - pc); 
+            pack_B_panel(packedB, &B->int4_data_ptr[(size_t)jc * k / 2 + pc / 2], k, jlim); 
+            for (int ic = 0; ic < m; jc += MC) {
+                const int ilim = std::min(MC, m - ic); 
 
-                
+                // potential TODO: memset the C-tile to zero? 
 
+                const int8_t *Aptr = &A->int8_data_ptr[(size_t)ic * k + pc]; 
+                const float *Sa = &params->A_scales[(size_t)ic * k / 32 + pc / 32]; 
+                const float *Sw = &params->scales[(size_t) jc * k/32 + pc / 32]; 
 
-                // TODO: decode each uint8x16_t weight vector into the lower and upper half of the weights as int8x16_t
-                // Hint:
-                // (1) use `vandq_u8` with the mask_low4bit to get the lower half
-                // (2) use `vshrq_n_u8` to right shift 4 bits and get the upper half
-                // (3) use `vreinterpretq_s8_u8` to interpret the  vector as int8
-                // lowbit mask
-                const int8x16_t signed_w0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(mask_low4bit, w0)), offsets); 
-                const int8x16_t signed_w0_16 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w0, 4)), offsets); 
+                // micro tiles: 4 columns each  (over the N dimension of the output matrix)
+                for (int j = 0; j < jlim; j += 4) {
+                    kernel_8x4(&C->data_ptr[(size_t)ic * n + jc + j], n, Aptr, k, packedB + (size_t)j *KC*2, jlim*KC*2, Sa, Sw + (size_t)j*KC/32, klim); 
 
-                const int8x16_t signed_w1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(mask_low4bit, w1)), offsets); 
-                const int8x16_t signed_w1_16 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w1, 4)), offsets); 
-
-                const int8x16_t signed_w2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(mask_low4bit, w2)), offsets); 
-                const int8x16_t signed_w2_16 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w2, 4)), offsets); 
-
-                const int8x16_t signed_w3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(mask_low4bit, w3)), offsets); 
-                const int8x16_t signed_w3_16 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w3, 4)), offsets); 
-                
-
-                // TODO: apply zero_point to weights and convert the range from (0, 15) to (-8, 7)
-                // Hint: using `vsubq_s8` to the lower-half and upper-half vectors of weights
-                
-
-                // load 128 8-bit activation
-                const int8x16_t a0 = vld1q_s8(a_start);
-                const int8x16_t a1 = vld1q_s8(a_start + 16);
-                const int8x16_t a2 = vld1q_s8(a_start + 32);
-                const int8x16_t a3 = vld1q_s8(a_start + 48);
-                const int8x16_t a4 = vld1q_s8(a_start + 64);
-                const int8x16_t a5 = vld1q_s8(a_start + 80);
-                const int8x16_t a6 = vld1q_s8(a_start + 96);
-                const int8x16_t a7 = vld1q_s8(a_start + 112);
-                a_start += 128;
-
-                // TODO: perform dot product and store the result into the intermediate sum, int_sum0
-                // Hint: use `vdotq_s32` and store the sum for each block in int_sum{0-3}
-                int32x4_t int_sum0, int_sum1, int_sum2, int_sum3;
-                int_sum0 = vdupq_n_s32(0); 
-                int_sum1 = vdupq_n_s32(0); 
-                int_sum2 = vdupq_n_s32(0); 
-                int_sum3 = vdupq_n_s32(0); 
-
-                int_sum0 = vdotq_s32(int_sum0, a0, signed_w0); 
-                int_sum0 = vdotq_s32(int_sum0, a1, signed_w0_16); 
-
-                int_sum1 = vdotq_s32(int_sum1, a2, signed_w1); 
-                int_sum1 = vdotq_s32(int_sum1, a3, signed_w1_16); 
-
-                int_sum2 = vdotq_s32(int_sum2, a4, signed_w2); 
-                int_sum2 = vdotq_s32(int_sum2, a5, signed_w2_16); 
-
-                int_sum3 = vdotq_s32(int_sum3, a6, signed_w3); 
-                int_sum3 = vdotq_s32(int_sum3, a7, signed_w3_16); 
-
-
-                float s_0 = *s_a++ * *s_w++;
-                float s_1 = *s_a++ * *s_w++;
-                float s_2 = *s_a++ * *s_w++;
-                float s_3 = *s_a++ * *s_w++;
-
-                sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(int_sum0), s_0);
-                sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(int_sum1), s_1);
-                sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(int_sum2), s_2);
-                sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(int_sum3), s_3);
+                }
             }
-            params->C.data_ptr[row * n + col] = vaddvq_f32(sumv0);
-#endif
-#ifdef QM_x86
-            // order of weights with QM_x86:
-            // origin order: (w0,w1), (w2,w3), (w4,w5), (w6,w7), (w8, w9), ... (w62,w63)
-            // QM_ARM order: (w0,w32),(w1,w33),(w2,w34),(w3,w35),(w4, w36),... (w31,w63)
-            //               |--|
-            //               4 bits
-            //               |------|
-            //               8 bits (byte)
-            //            low|----------------------------------------------------------|high
-            //               0                         256 bit
-            __m256 accumulator = _mm256_setzero_ps();
-            float *s_ptr = &params->scales[col * k / 32];
-            float *sa_ptr = &params->A_scales[row * k / 32];
-            const __m256i *w_start = (__m256i *)&B->int4_data_ptr[col * k / 2];
-            const __m256i *a_start = (__m256i *)&A->int8_data_ptr[row * k];
-            const int num_block = k / block_size;
-            // Compute four blocks = 128 4-bit weights in each iteration
-            for (int q = 0; q < num_block; q += 4) {
-                // lowbit mask
-                const __m256i lowMask = _mm256_set1_epi8(0xF);
-
-                // TODO: Unpack 128 4-bit (two __mm256i) weights into 128 8-bit (four __mm256i)
-                // (1) load 256 bit from w_strat with _mm256_loadu_si256
-                // (2) use _mm256_and_si256 and lowMask to extract the lower half of wegihts
-                // (3) use _mm256_srli_epi16 and _mm256_and_si256 with lowMask to extract the upper half of weights
-                __m256i raw_w = _mm256_loadu_si256(w_start);
-                __m256i raw_w_next = _mm256_loadu_si256(w_start + 1);
-
-                // TODO: apply zero_point to weights and convert the range from (0, 15) to (-8, 7)
-                // Hint: using `_mm256_sub_epi8` to the lower-half and upper-half vectors of weights
-                // Note: For the first two blocks, store the lower half and upper half of weights into `w_0` and
-                // `w_128`, respectively For the last two blocks store the lower half and upper half of weights into
-                // `w_0_next` and `w_128_next`, respectively
-                const __m256i zero_point = _mm256_set1_epi8(8);
-                __m256i w_0, w_128, w_0_next, w_128_next;
-
-                // Perform int8 dot product with _mm256_maddubs_epi16
-                /* Syntax of _mm256_maddubs_epi16:
-                   __m256i _mm256_maddubs_epi16(__m256i s1, __m256i s2): Multiplies vertically each unsigned byte of
-                   source vector s1 with the corresponding signed byte of source vector s2, producing intermediate,
-                   signed 16-bit integers. Each adjacent pair of signed words is added, and the saturated result is
-                   packed to the destination vector.
-                */
-                // To utilize _mm256_maddubs_epi16 which only takes unsigned s1, we need to:
-                // (1) Get the absolute values of weights (for both lower and upper halves)
-                // (2) Change the sign of activation (a0-a31 and a32-a63) depending on the sign of corresponding weights
-                // (stored as another variable) (3) Perform dot product with _mm256_maddubs_epi16 and store the lower
-                // and upper halves sum in `dot` and `dot2`
-                __m256i dot, dot2, dot3, dot4;
-                // Get absolute values of x vectors
-                const __m256i ax = _mm256_sign_epi8(w_0, w_0);
-                const __m256i ax_next = _mm256_sign_epi8(w_0_next, w_0_next);
-                const __m256i ax2 = _mm256_sign_epi8(w_128, w_128);
-                const __m256i ax2_next = _mm256_sign_epi8(w_128_next, w_128_next);
-                // Load activation
-                __m256i activation = a_start[0];
-                __m256i activation2 = a_start[1];
-                __m256i activation_next = a_start[2];
-                __m256i activation2_next = a_start[3];
-                // Sign the values of the y vectors
-                const __m256i sy = _mm256_sign_epi8(activation, w_0);
-                const __m256i sy_next = _mm256_sign_epi8(activation_next, w_0_next);
-                const __m256i sy2 = _mm256_sign_epi8(activation2, w_128);
-                const __m256i sy2_next = _mm256_sign_epi8(activation2_next, w_128_next);
-
-                // TODO: Perform int8 dot product with `_mm256_maddubs_epi16`
-                // Hint: use `_mm256_maddubs_epi16` to complete the following computation
-                // dot = ax * sy
-                // dot2 = ax2 * sy2
-                // dot3 = ax_next * sy_next
-                // dot4 = ax2_next * sy2_next
-
-                // Convert int32 vectors to floating point vectors
-                const __m256i ones = _mm256_set1_epi16(1);
-                const __m256i summed_pairs = _mm256_madd_epi16(ones, dot);
-                const __m256i summed_pairs2 = _mm256_madd_epi16(ones, dot2);
-                const __m256i summed_pairs3 = _mm256_madd_epi16(ones, dot3);
-                const __m256i summed_pairs4 = _mm256_madd_epi16(ones, dot4);
-                __m256 intermediate = _mm256_cvtepi32_ps(summed_pairs);
-                __m256 intermediate2 = _mm256_cvtepi32_ps(summed_pairs2);
-                __m256 intermediate3 = _mm256_cvtepi32_ps(summed_pairs3);
-                __m256 intermediate4 = _mm256_cvtepi32_ps(summed_pairs4);
-
-                // Create vectors for scales and apply them to intermediate results
-                __m256 v_s = _mm256_set1_ps(s_ptr[0] * sa_ptr[0]);
-                __m256 v_s2 = _mm256_set1_ps(s_ptr[1] * sa_ptr[1]);
-                __m256 v_s3 = _mm256_set1_ps(s_ptr[2] * sa_ptr[2]);
-                __m256 v_s4 = _mm256_set1_ps(s_ptr[3] * sa_ptr[3]);
-                accumulator = _mm256_fmadd_ps(intermediate, v_s, accumulator);
-                accumulator = _mm256_fmadd_ps(intermediate2, v_s2, accumulator);
-                accumulator = _mm256_fmadd_ps(intermediate3, v_s3, accumulator);
-                accumulator = _mm256_fmadd_ps(intermediate4, v_s4, accumulator);
-                s_ptr += 4;
-                sa_ptr += 4;
-                w_start += 2;
-                a_start += 4;
-            }
-            float *ptr = (float *)&accumulator;
-            C->data_ptr[row * n + col] = ptr[0] + ptr[1] + ptr[2] + ptr[3] + ptr[4] + ptr[5] + ptr[6] + ptr[7];
-#endif
         }
     }
 
-    return NULL;
+
+    return nullptr; 
+
 }
 
 namespace matmul {
+
+// CACHE BLOCKED IMPLEMENTATION INCLUDING PER-THREAD SCRATCH BUFFER 
 void MatmulOperator::mat_mul_all_techniques(struct matmul_params *params) {
     int i, j, k;
     const struct matrix *A = &params->A, *B = &params->B, *C = &params->C;
@@ -251,17 +154,20 @@ void MatmulOperator::mat_mul_all_techniques(struct matmul_params *params) {
 
     const int num_thread = 8;
     pthread_t thread_pool[num_thread];
-    struct w4a8_thread_args threads_args[num_thread];
+    struct thread_arg targs[num_thread];
+
+    int8_t *scratch[num_thread]; 
+    for (int t = 0; t < num_thread; ++t) {
+        posix_memalign(reinterpret_cast<void**>(&scratch[t]), 64, NC * KC * 2); 
+    }
     assert(params->block_size == 32);  // support block size 32 for now
 
      int thread_block_size = C->column / num_thread; 
 
     // TODO: Thread creation
     for (int i = 0; i < num_thread; ++i) {
-        threads_args[i].start_j = i*thread_block_size; 
-        threads_args[i].end_j = (i+1)*thread_block_size; 
-        threads_args[i].params = params; 
-        pthread_create(&thread_pool[i], nullptr, all_techniques_worker_func, &threads_args[i]); 
+        targs[i] = {i*thread_block_size, std::min(C->column, (i+1)*thread_block_size), params, scratch[i]}; 
+        pthread_create(&thread_pool[i], nullptr, worker, &targs[i]); 
 
     }
 
@@ -269,9 +175,9 @@ void MatmulOperator::mat_mul_all_techniques(struct matmul_params *params) {
 
     for (int i = 0; i < num_thread; ++i) {
         pthread_join(thread_pool[i], nullptr); 
+        free(scratch[i]); 
+
 
     }
-
-    // TODO: Join threads
 };
 }  // namespace matmul
